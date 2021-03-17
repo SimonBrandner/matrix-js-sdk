@@ -28,7 +28,13 @@ import MatrixEvent from '../models/event';
 import {EventType} from '../@types/event';
 import { RoomMember } from '../models/room-member';
 import { randomString } from '../randomstring';
-import { MCallReplacesEvent, MCallAnswer, MCallOfferNegotiate, CallCapabilities } from './callEventTypes';
+import {
+    MCallReplacesEvent,
+    MCallAnswer,
+    MCallOfferNegotiate,
+    CallCapabilities,
+    SDPStreamMetaData,
+} from './callEventTypes';
 import { CallFeed, CallFeedType } from './callFeed';
 
 // events: hangup, error(err), replaced(call), state(state, oldState)
@@ -255,6 +261,11 @@ export class MatrixCall extends EventEmitter {
     private screenSharingStream: MediaStream;
     private remoteStream: MediaStream;
     private localAVStream: MediaStream;
+    private localAVSdpMetadata: SDPStreamMetaData;
+    private localScreenshareSdpMetadata: SDPStreamMetaData;
+    private remoteSdpMetadata: Array<SDPStreamMetaData>;
+    private localAVSenders: Array<RTCRtpSender>;
+    private localScreenshareSenders: Array<RTCRtpSender>;
     private inviteOrAnswerSent: boolean;
     private waitForLocalAVStream: boolean;
     // XXX: I don't know why this is called 'config'.
@@ -330,6 +341,8 @@ export class MatrixCall extends EventEmitter {
         this.vidMuted = false;
 
         this.feeds = [];
+        this.localAVSenders = [];
+        this.remoteSdpMetadata = [];
     }
 
     /**
@@ -337,11 +350,11 @@ export class MatrixCall extends EventEmitter {
      * @throws If you have not specified a listener for 'error' events.
      */
     async placeVoiceCall() {
+        this.type = CallType.Voice;
         logger.debug("placeVoiceCall");
         this.checkForErrorListener();
         const constraints = getUserMediaContraints(ConstraintsType.Audio);
         await this.placeCallWithConstraints(constraints);
-        this.type = CallType.Voice;
     }
 
     /**
@@ -349,11 +362,11 @@ export class MatrixCall extends EventEmitter {
      * @throws If you have not specified a listener for 'error' events.
      */
     async placeVideoCall() {
+        this.type = CallType.Video;
         logger.debug("placeVideoCall");
         this.checkForErrorListener();
         const constraints = getUserMediaContraints(ConstraintsType.Video);
         await this.placeCallWithConstraints(constraints);
-        this.type = CallType.Video;
     }
 
     /**
@@ -363,6 +376,7 @@ export class MatrixCall extends EventEmitter {
      * @throws If you have not specified a listener for 'error' events.
      */
     async placeScreenSharingCall(selectDesktopCapturerSource: () => Promise<DesktopCapturerSource>) {
+        this.type = CallType.Video;
         logger.debug("placeScreenSharingCall");
         this.checkForErrorListener();
         try {
@@ -389,7 +403,6 @@ export class MatrixCall extends EventEmitter {
                 ),
             );
         }
-        this.type = CallType.Video;
     }
 
     public getOpponentMember() {
@@ -420,10 +433,15 @@ export class MatrixCall extends EventEmitter {
     private pushNewFeed(stream: MediaStream, userId: string, type: CallFeedType) {
         // Try to find a feed with the same stream id as the new stream,
         // if we find it replace the old stream with the new one
-        const feed = this.feeds.find((feed) => feed.stream.id === stream.id);
-        if (feed) {
+        try {
+            const metadata = [this.localAVSdpMetadata, ...this.remoteSdpMetadata];
+            // Find metadata for our stream
+            console.log("LOG pushNewFeed metadata", metadata);
+            const meta = metadata.find((meta) => meta.streamId === stream.id);
+            const feed = this.feeds.find((feed) => feed.userId === meta.userId && feed.type === meta.type);
             feed.setNewStream(stream);
-        } else {
+            return;
+        } catch {
             this.feeds.push(new CallFeed(stream, userId, type, this.client));
             this.emit(CallEvent.FeedsChanged, this.feeds);
         }
@@ -462,6 +480,11 @@ export class MatrixCall extends EventEmitter {
      * @param {MatrixEvent} event The m.call.invite event
      */
     async initWithInvite(event: MatrixEvent) {
+        const metadata = event.getContent().metadata;
+        console.log("LOG initWithInvite metadata", metadata)
+        if (metadata) {
+            this.remoteSdpMetadata = event.metadata;
+        }
         const invite = event.getContent();
         this.direction = CallDirection.Inbound;
 
@@ -628,8 +651,39 @@ export class MatrixCall extends EventEmitter {
      * Set whether our outbound video should be muted or not.
      * @param {boolean} muted True to mute the outbound video.
      */
-    setLocalVideoMuted(muted: boolean) {
+    async setLocalVideoMuted(muted: boolean) {
         this.vidMuted = muted;
+        // Handle upgrade to a video call
+        if (this.type === CallType.Voice && muted === false) {
+            const constraints = getUserMediaContraints(ConstraintsType.Video);
+            const stream = await navigator.mediaDevices.getUserMedia(constraints);
+            this.localAVSdpMetadata = {
+                streamId: stream.id,
+                userId: this.client.getUserId(),
+                type: CallFeedType.Webcam,
+            };
+
+            for (const sender of this.localAVSenders) {
+                this.peerConn.removeTrack(sender);
+                this.localAVSenders = [];
+            }
+
+            this.localAVStream = stream;
+            this.pushNewFeed(stream, this.client.getUserId(), CallFeedType.Webcam);
+            // Maintain the old muted status for the new stream
+            this.setMicrophoneMuted(this.micMuted);
+
+            for (const audioTrack of stream.getAudioTracks()) {
+                logger.info("Adding audio track with id " + audioTrack.id);
+                this.localAVSenders.push(this.peerConn.addTrack(audioTrack, stream));
+            }
+            for (const videoTrack of stream.getVideoTracks()) {
+                logger.info("Adding video track with id " + videoTrack.id);
+                this.localAVSenders.push(this.peerConn.addTrack(videoTrack, stream));
+            }
+
+            this.type = CallType.Video;
+        }
         this.updateMuteStatus();
     }
 
@@ -643,6 +697,7 @@ export class MatrixCall extends EventEmitter {
      * (including if the call is not set up yet).
      */
     isLocalVideoMuted(): boolean {
+        if (this.type === CallType.Voice) return true;
         return this.vidMuted;
     }
 
@@ -769,6 +824,11 @@ export class MatrixCall extends EventEmitter {
             );
             this.pushNewFeed(this.screenSharingStream, this.client.getUserId(), CallFeedType.Screenshare);
         } else {
+            this.localAVSdpMetadata = {
+                streamId: stream.id,
+                userId: this.client.getUserId(),
+                type: CallFeedType.Webcam,
+            };
             this.pushNewFeed(stream, this.client.getUserId(), CallFeedType.Webcam);
         }
 
@@ -777,11 +837,11 @@ export class MatrixCall extends EventEmitter {
 
         for (const audioTrack of stream.getAudioTracks()) {
             logger.info("Adding audio track with id " + audioTrack.id);
-            this.peerConn.addTrack(audioTrack, stream);
+            this.localAVSenders.push(this.peerConn.addTrack(audioTrack, stream));
         }
         for (const videoTrack of (this.screenSharingStream || stream).getVideoTracks()) {
             logger.info("Adding video track with id " + videoTrack.id);
-            this.peerConn.addTrack(videoTrack, stream);
+            this.localAVSenders.push(this.peerConn.addTrack(videoTrack, stream));
         }
 
         // Now we wait for the negotiationneeded event
@@ -802,6 +862,8 @@ export class MatrixCall extends EventEmitter {
                 'm.call.transferee': true,
             }
         }
+
+        answerContent.metadata = [this.localAVSdpMetadata];
 
         // We have just taken the local description from the peerconnection which will
         // contain all the local candidates added so far, so we can discard any candidates
@@ -842,10 +904,15 @@ export class MatrixCall extends EventEmitter {
         this.pushNewFeed(stream, this.client.getUserId(), CallFeedType.Webcam);
 
         this.localAVStream = stream;
+        this.localAVSdpMetadata = {
+            streamId: stream.id,
+            userId: this.client.getUserId(),
+            type: CallFeedType.Webcam,
+        }
         logger.info("Got local AV stream with id " + this.localAVStream.id);
         setTracksEnabled(stream.getAudioTracks(), true);
         for (const track of stream.getTracks()) {
-            this.peerConn.addTrack(track, stream);
+            this.localAVSenders.push(this.peerConn.addTrack(track, stream));
         }
 
         this.setState(CallState.CreateAnswer);
@@ -957,6 +1024,11 @@ export class MatrixCall extends EventEmitter {
      * @param {Object} msg
      */
     async onAnswerReceived(event: MatrixEvent) {
+        const metadata = event.getContent().metadata;
+        console.log("LOG onAnswerReceived metadata", metadata);
+        if (metadata) {
+            this.remoteSdpMetadata = metadata;
+        }
         if (this.callHasEnded()) {
             return;
         }
@@ -1018,6 +1090,11 @@ export class MatrixCall extends EventEmitter {
     }
 
     async onNegotiateReceived(event: MatrixEvent) {
+        const metadata = event.getContent().metadata;
+        console.log("LOG onNegotiateReceived metadata", metadata);
+        if (metadata) {
+            this.remoteSdpMetadata = metadata;
+        }
         const description = event.getContent().description;
         if (!description || !description.sdp || !description.type) {
             logger.info("Ignoring invalid m.call.negotiate event");
@@ -1069,8 +1146,10 @@ export class MatrixCall extends EventEmitter {
                     tranceiver.direction = tranceiver.currentDirection;
                 }
 
+                // Give back our SDP
                 this.sendVoipEvent(EventType.CallNegotiate, {
                     description: this.peerConn.localDescription,
+                    metadata: [this.localAVSdpMetadata],
                 });
             }
         } catch (err) {
@@ -1135,6 +1214,11 @@ export class MatrixCall extends EventEmitter {
             content.capabilities = {
                 'm.call.transferee': true,
             }
+        }
+
+        console.log("LOG gotLocalOffer", [this.localAVSdpMetadata]);
+        if (this.localAVSdpMetadata) {
+            content.metadata = [this.localAVSdpMetadata];
         }
 
         // Get rid of any candidates waiting to be sent: they'll be included in the local
@@ -1240,6 +1324,10 @@ export class MatrixCall extends EventEmitter {
             logger.warn(`Streamless ${ev.track.kind} found: ignoring.`);
             return;
         }
+        this.remoteStream = ev.streams[0];
+        this.pushNewFeed(ev.streams[0], this.getOpponentMember().userId, CallFeedType.Webcam);
+        return;
+
         // If we already have a stream, check this track is from the same one
         if (this.remoteStream && ev.streams[0].id !== this.remoteStream.id) {
             logger.warn(
@@ -1259,7 +1347,6 @@ export class MatrixCall extends EventEmitter {
 
         logger.debug(`Track id ${ev.track.id} of kind ${ev.track.kind} added`);
 
-        this.pushNewFeed(this.remoteStream, this.getOpponentMember().userId, CallFeedType.Webcam)
 
         logger.info("playing remote. stream active? " + this.remoteStream.active);
     };

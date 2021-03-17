@@ -1,6 +1,8 @@
 // allow camelcase as these are events type that go onto the wire
 /* eslint-disable camelcase */
 
+import {CallFeedType} from "./callFeed";
+
 interface CallOfferAnswer {
     type: string;
     sdp: string;
@@ -10,9 +12,16 @@ export interface CallCapabilities {
     'm.call.transferee': boolean;
 }
 
+export interface SDPStreamMetaData {
+    streamId: string;
+    type: CallFeedType;
+    userId: string;
+}
+
 export interface MCallAnswer {
     answer: CallOfferAnswer;
     capabilities: CallCapabilities;
+    metadata: Array<SDPStreamMetaData>;
 }
 
 export interface MCallOfferNegotiate {
@@ -20,6 +29,7 @@ export interface MCallOfferNegotiate {
     description: CallOfferAnswer;
     lifetime: number;
     capabilities: CallCapabilities;
+    metadata: Array<SDPStreamMetaData>;
 }
 
 export interface MCallReplacesTarget {
