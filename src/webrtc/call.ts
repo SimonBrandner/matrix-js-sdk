@@ -432,7 +432,7 @@ export class MatrixCall extends EventEmitter {
     private pushNewFeed(stream: MediaStream, userId: string, purpose: SDPStreamMetadataPurpose) {
         // Try to find a feed with the same stream id as the new stream,
         // if we find it replace the old stream with the new one
-        const feed = this.feeds.find((feed) => feed.stream.id === stream.id);
+        const feed = this.feeds.find((feed) => feed.userId === userId);
         if (feed) {
             feed.setNewStream(stream);
         } else {
@@ -643,9 +643,25 @@ export class MatrixCall extends EventEmitter {
      * Set whether our outbound video should be muted or not.
      * @param {boolean} muted True to mute the outbound video.
      */
-    setLocalVideoMuted(muted: boolean) {
+    async setLocalVideoMuted(muted: boolean) {
         this.vidMuted = muted;
-        this.updateMuteStatus();
+        for (const track of this.localAVStream.getTracks()) {
+            track.stop()
+        }
+        const vidShouldBeMuted = this.vidMuted || this.remoteOnHold;
+        if (vidShouldBeMuted) {
+            const stream = await navigator.mediaDevices.getUserMedia(getUserMediaContraints(ConstraintsType.Audio));
+            this.localAVStream = stream;
+            for (const track of stream.getTracks()) {
+                this.peerConn.addTrack(track, stream);
+            }
+        } else {
+            const stream = await navigator.mediaDevices.getUserMedia(getUserMediaContraints(ConstraintsType.Video));
+            this.localAVStream = stream;
+            for (const track of stream.getTracks()) {
+                this.peerConn.addTrack(track, stream);
+            }
+        }
     }
 
     /**
@@ -1257,13 +1273,6 @@ export class MatrixCall extends EventEmitter {
     private onTrack = (ev: RTCTrackEvent) => {
         if (ev.streams.length === 0) {
             logger.warn(`Streamless ${ev.track.kind} found: ignoring.`);
-            return;
-        }
-        // If we already have a stream, check this track is from the same one
-        if (this.remoteStream && ev.streams[0].id !== this.remoteStream.id) {
-            logger.warn(
-                `Ignoring new stream ID ${ev.streams[0].id}: we already have stream ID ${this.remoteStream.id}`,
-            );
             return;
         }
 
