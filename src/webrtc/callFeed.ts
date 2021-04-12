@@ -19,9 +19,12 @@ import {SDPStreamMetadataPurpose} from "./callEventTypes";
 
 export enum CallFeedEvent {
     NewStream = "new_stream",
+    VideoMuted = "video_muted",
 }
 
 export class CallFeed extends EventEmitter {
+    private videoMuted;
+
     constructor(
         public stream: MediaStream,
         public userId: string,
@@ -30,6 +33,20 @@ export class CallFeed extends EventEmitter {
         private roomId: string,
     ) {
         super()
+        stream.getVideoTracks()[0].addEventListener("mute", this.onMute);
+        stream.getVideoTracks()[0].addEventListener("unmute", this.onUnmute);
+    }
+
+    onMute = () => {
+        console.log("LOG onMute");
+        this.videoMuted = true;
+        this.emit(CallFeedEvent.VideoMuted, this.videoMuted);
+    }
+
+    onUnmute = () => {
+        console.log("LOG onUnmute");
+        this.videoMuted = false;
+        this.emit(CallFeedEvent.VideoMuted, this.videoMuted);
     }
 
     /**
@@ -67,7 +84,7 @@ export class CallFeed extends EventEmitter {
      */
     public isVideoMuted(): boolean {
         // We assume only one video track
-        return this.stream.getVideoTracks().length === 0;
+        return this.stream.getVideoTracks().length === 0 || this.videoMuted;
     }
 
     /**

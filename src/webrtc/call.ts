@@ -645,7 +645,20 @@ export class MatrixCall extends EventEmitter {
      */
     setLocalVideoMuted(muted: boolean) {
         this.vidMuted = muted;
-        this.updateMuteStatus();
+
+        let transceiver;
+        for (const trans of this.peerConn.getTransceivers()) {
+            if (trans.sender?.track?.id === this.localAVStream.getVideoTracks()[0].id) {
+                transceiver = trans;
+            }
+        }
+
+        if (muted) {
+            transceiver.direction = "recvonly";
+        } else {
+            transceiver.direction = "sendrecv";
+        }
+        //this.updateMuteStatus();
     }
 
     /**
